@@ -105,7 +105,7 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["javaboot.imdo.co"];
+pub const RENDEZVOUS_SERVERS: &[&str] = &["aicore.qzz.io"];
 pub const RS_PUB_KEY: &str = "9m4ZMWVDJluTtfSpZmA0EeTxrF7NRgMxPoJk2Dwtet4=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
