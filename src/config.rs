@@ -90,6 +90,7 @@ pub const LINK_DOCS_HOME: &str = "https://rustdesk.com/docs/en/";
 pub const LINK_DOCS_X11_REQUIRED: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 pub const LINK_HEADLESS_LINUX_SUPPORT: &str =
     "https://github.com/rustdesk/rustdesk/wiki/Headless-Linux-Support";
+
 lazy_static::lazy_static! {
     pub static ref HELPER_URL: HashMap<&'static str, &'static str> = HashMap::from([
         ("rustdesk docs home", LINK_DOCS_HOME),
@@ -105,7 +106,7 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["javaboot.imdo.co"];
+pub const RENDEZVOUS_SERVERS: &[&str] = &["aicore.qzz.io"];
 pub const RS_PUB_KEY: &str = "9m4ZMWVDJluTtfSpZmA0EeTxrF7NRgMxPoJk2Dwtet4=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
@@ -587,6 +588,7 @@ impl Config {
             store = true;
         }
         if !id_valid {
+            log::warn!("ID is invalid, generating new one");
             for _ in 0..3 {
                 if let Some(id) = Config::gen_id() {
                     config.id = id;
@@ -625,6 +627,23 @@ impl Config {
         (self.id.is_empty() && self.enc_id.is_empty()) || self.key_pair.0.is_empty()
     }
 
+    /// Get the user's home directory for configuration purposes.
+    ///
+    /// # Security Note
+    /// This function uses `dirs_next::home_dir()` which reads the `$HOME` environment
+    /// variable on Unix systems. This is acceptable for user-space operations (config
+    /// file storage, logging) where the user may intentionally redirect their home
+    /// directory.
+    ///
+    /// **DO NOT use this function in privileged contexts** (e.g., code executed via
+    /// `gtk_sudo` or system services running as root). For privileged operations on
+    /// Linux, use `crate::platform::linux::get_home_dir_trusted()` which bypasses
+    /// the `$HOME` environment variable and queries the system password database
+    /// directly via `getpwuid`.
+    ///
+    /// Using `$HOME` in privileged contexts creates a confused-deputy vulnerability
+    /// where an attacker can manipulate the environment variable to inject malicious
+    /// paths into privileged operations.
     pub fn get_home() -> PathBuf {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         return PathBuf::from(APP_HOME_DIR.read().unwrap().as_str());
@@ -665,6 +684,12 @@ impl Config {
         }
     }
 
+    /// Get the log directory path.
+    ///
+    /// # Security Note
+    /// On macOS, this function uses `dirs_next::home_dir()` which reads the `$HOME`
+    /// environment variable. On Linux/Android, it uses `Self::get_home()`.
+    /// See [`Self::get_home()`] for security considerations regarding `$HOME` usage.
     #[allow(unreachable_code)]
     pub fn log_path() -> PathBuf {
         #[cfg(target_os = "macos")]
@@ -894,6 +919,7 @@ impl Config {
                     id = (id << 8) | (*x as u32);
                 }
                 id &= 0x1FFFFFFF;
+                log::info!("Generated id {}", id);
                 Some(id.to_string())
             } else {
                 None
@@ -968,12 +994,64 @@ impl Config {
         config.key_pair
     }
 
+    pub fn get_cached_pk() -> Option<Vec<u8>> {
+        KEY_PAIR.lock().unwrap().clone().map(|k| k.1)
+    }
+
+    /// Get existing key pair without generating a new one.
+    /// Returns None if no key pair exists in cache or config file.
+    pub fn get_existing_key_pair() -> Option<KeyPair> {
+        let mut lock = KEY_PAIR.lock().unwrap();
+        if let Some(p) = lock.as_ref() {
+            return Some(p.clone());
+        }
+
+        // IMPORTANT: this path is called while holding KEY_PAIR lock.
+        // Config::load_ must remain a raw conf load/deserialize path and must never
+        // call decrypt_* / symmetric_crypt (directly or indirectly), otherwise this
+        // can re-enter key loading and deadlock.
+        let config = Config::load_::<Config>("");
+        if !config.key_pair.0.is_empty() {
+            *lock = Some(config.key_pair.clone());
+            Some(config.key_pair)
+        } else {
+            None
+        }
+    }
+
     pub fn no_register_device() -> bool {
         BUILTIN_SETTINGS
             .read()
             .unwrap()
             .get(keys::OPTION_REGISTER_DEVICE)
             .map(|v| v == "N")
+            .unwrap_or(false)
+    }
+
+    pub fn is_disable_change_permanent_password() -> bool {
+        BUILTIN_SETTINGS
+            .read()
+            .unwrap()
+            .get(keys::OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD)
+            .map(|v| v == "Y")
+            .unwrap_or(false)
+    }
+
+    pub fn is_disable_change_id() -> bool {
+        BUILTIN_SETTINGS
+            .read()
+            .unwrap()
+            .get(keys::OPTION_DISABLE_CHANGE_ID)
+            .map(|v| v == "Y")
+            .unwrap_or(false)
+    }
+
+    pub fn is_disable_unlock_pin() -> bool {
+        BUILTIN_SETTINGS
+            .read()
+            .unwrap()
+            .get(keys::OPTION_DISABLE_UNLOCK_PIN)
+            .map(|v| v == "Y")
             .unwrap_or(false)
     }
 
@@ -1063,13 +1141,18 @@ impl Config {
     }
 
     pub fn set_permanent_password(password: &str) {
+        if Self::is_disable_change_permanent_password() {
+            return;
+        }
         if HARD_SETTINGS
             .read()
             .unwrap()
             .get("password")
             .map_or(false, |v| v == password)
         {
-            return;
+            if CONFIG.read().unwrap().password.is_empty() {
+                return;
+            }
         }
         let mut config = CONFIG.write().unwrap();
         if password == config.password {
@@ -1209,10 +1292,16 @@ impl Config {
     }
 
     pub fn get_unlock_pin() -> String {
+        if Self::is_disable_unlock_pin() {
+            return String::new();
+        }
         CONFIG2.read().unwrap().unlock_pin.clone()
     }
 
     pub fn set_unlock_pin(pin: &str) {
+        if Self::is_disable_unlock_pin() {
+            return;
+        }
         let mut config = CONFIG2.write().unwrap();
         if pin == config.unlock_pin {
             return;
@@ -1290,7 +1379,29 @@ impl Config {
         }
         *lock = cfg;
         lock.store();
+        // Drop CONFIG lock before acquiring KEY_PAIR lock to avoid potential deadlock.
+        #[cfg(target_os = "macos")]
+        let new_key_pair = lock.key_pair.clone();
+        drop(lock);
+        #[cfg(target_os = "macos")]
+        Self::invalidate_key_pair_cache_if_changed(&new_key_pair);
         true
+    }
+
+    /// Invalidate KEY_PAIR cache if it differs from the new key_pair.
+    /// Use None to invalidate the cache instead of Some(key_pair).
+    /// If we use Some with an empty key_pair, get_key_pair() would always return
+    /// the empty key_pair from cache without regenerating.
+    /// By clearing the cache, get_key_pair() will reload and regenerate if needed.
+    #[cfg(target_os = "macos")]
+    fn invalidate_key_pair_cache_if_changed(new_key_pair: &KeyPair) {
+        let mut key_pair_cache = KEY_PAIR.lock().unwrap();
+        if let Some(cached) = key_pair_cache.as_ref() {
+            if cached != new_key_pair {
+                *key_pair_cache = None;
+                log::info!("key pair cache invalidated");
+            }
+        }
     }
 
     fn with_extension(path: PathBuf) -> PathBuf {
@@ -2236,6 +2347,12 @@ pub struct GroupUser {
         skip_serializing_if = "String::is_empty"
     )]
     pub name: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub display_name: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -2546,6 +2663,17 @@ pub mod keys {
     pub const OPTION_TRACKPAD_SPEED: &str = "trackpad-speed";
     pub const OPTION_REGISTER_DEVICE: &str = "register-device";
     pub const OPTION_RELAY_SERVER: &str = "relay-server";
+    pub const OPTION_ICE_SERVERS: &str = "ice-servers";
+    /// Maximum number of files allowed during a single file transfer request.
+    ///
+    /// Key: `file-transfer-max-files`.
+    /// Unit: number of files (not bytes).
+    ///
+    /// Behaviour:
+    /// - If set to a positive integer N, at most N files are allowed.
+    /// - If set to 0, a safe built-in default is used (see DEFAULT_MAX_VALIDATED_FILES).
+    /// - If unset, negative, or non-integer, no explicit limit is enforced for backward compatibility.
+    pub const OPTION_FILE_TRANSFER_MAX_FILES: &str = "file-transfer-max-files";
     pub const OPTION_DISABLE_UDP: &str = "disable-udp";
     pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
@@ -2553,9 +2681,11 @@ pub mod keys {
     // So `OPTION_SHOW_VIRTUAL_MOUSE` should also be set if `OPTION_SHOW_VIRTUAL_JOYSTICK` is set.
     pub const OPTION_SHOW_VIRTUAL_JOYSTICK: &str = "show-virtual-joystick";
     pub const OPTION_ENABLE_FLUTTER_HTTP_ON_RUST: &str = "enable-flutter-http-on-rust";
+    pub const OPTION_ALLOW_ASK_FOR_NOTE: &str = "allow-ask-for-note";
 
     // built-in options
     pub const OPTION_DISPLAY_NAME: &str = "display-name";
+    pub const OPTION_AVATAR: &str = "avatar";
     pub const OPTION_PRESET_DEVICE_GROUP_NAME: &str = "preset-device-group-name";
     pub const OPTION_PRESET_USERNAME: &str = "preset-user-name";
     pub const OPTION_PRESET_STRATEGY_NAME: &str = "preset-strategy-name";
@@ -2566,6 +2696,7 @@ pub mod keys {
     pub const OPTION_HIDE_PROXY_SETTINGS: &str = "hide-proxy-settings";
     pub const OPTION_HIDE_REMOTE_PRINTER_SETTINGS: &str = "hide-remote-printer-settings";
     pub const OPTION_HIDE_WEBSOCKET_SETTINGS: &str = "hide-websocket-settings";
+    pub const OPTION_HIDE_STOP_SERVICE: &str = "hide-stop-service";
 
     // Connection punch-through options
     pub const OPTION_ENABLE_UDP_PUNCH: &str = "enable-udp-punch";
@@ -2581,6 +2712,9 @@ pub mod keys {
     pub const OPTION_ALLOW_HOSTNAME_AS_ID: &str = "allow-hostname-as-id";
     pub const OPTION_HIDE_POWERED_BY_ME: &str = "hide-powered-by-me";
     pub const OPTION_MAIN_WINDOW_ALWAYS_ON_TOP: &str = "main-window-always-on-top";
+    pub const OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD: &str = "disable-change-permanent-password";
+    pub const OPTION_DISABLE_CHANGE_ID: &str = "disable-change-id";
+    pub const OPTION_DISABLE_UNLOCK_PIN: &str = "disable-unlock-pin";
 
     // flutter local options
     pub const OPTION_FLUTTER_REMOTE_MENUBAR_STATE: &str = "remoteMenubarState";
@@ -2605,6 +2739,12 @@ pub mod keys {
 
     // android keep screen on
     pub const OPTION_KEEP_SCREEN_ON: &str = "keep-screen-on";
+
+    // Server-side: keep host system awake during incoming sessions (Security setting)
+    pub const OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS: &str = "keep-awake-during-incoming-sessions";
+
+    // Client-side: keep client system awake during outgoing sessions (General setting)  
+    pub const OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS: &str = "keep-awake-during-outgoing-sessions";
 
     pub const OPTION_DISABLE_GROUP_PANEL: &str = "disable-group-panel";
     pub const OPTION_DISABLE_DISCOVERY_PANEL: &str = "disable-discovery-panel";
@@ -2676,6 +2816,8 @@ pub mod keys {
         OPTION_FLOATING_WINDOW_TRANSPARENCY,
         OPTION_FLOATING_WINDOW_SVG,
         OPTION_KEEP_SCREEN_ON,
+        // Client-side: keep client system awake during outgoing sessions (General setting)
+        OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS,
         OPTION_DISABLE_GROUP_PANEL,
         OPTION_DISABLE_DISCOVERY_PANEL,
         OPTION_PRE_ELEVATE_SERVICE,
@@ -2688,6 +2830,7 @@ pub mod keys {
         OPTION_SHOW_VIRTUAL_MOUSE,
         OPTION_SHOW_VIRTUAL_JOYSTICK,
         OPTION_ENABLE_FLUTTER_HTTP_ON_RUST,
+        OPTION_ALLOW_ASK_FOR_NOTE,
     ];
     // DEFAULT_SETTINGS, OVERWRITE_SETTINGS
     pub const KEYS_SETTINGS: &[&str] = &[
@@ -2740,13 +2883,17 @@ pub mod keys {
         OPTION_ENABLE_ANDROID_SOFTWARE_ENCODING_HALF_SCALE,
         OPTION_ENABLE_TRUSTED_DEVICES,
         OPTION_RELAY_SERVER,
+        OPTION_ICE_SERVERS,
         OPTION_DISABLE_UDP,
         OPTION_ALLOW_INSECURE_TLS_FALLBACK,
+        OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
+        OPTION_ALLOW_AUTO_UPDATE,
     ];
 
     // BUILDIN_SETTINGS
     pub const KEYS_BUILDIN_SETTINGS: &[&str] = &[
         OPTION_DISPLAY_NAME,
+        OPTION_AVATAR,
         OPTION_PRESET_DEVICE_GROUP_NAME,
         OPTION_PRESET_USERNAME,
         OPTION_PRESET_STRATEGY_NAME,
@@ -2757,6 +2904,7 @@ pub mod keys {
         OPTION_HIDE_PROXY_SETTINGS,
         OPTION_HIDE_REMOTE_PRINTER_SETTINGS,
         OPTION_HIDE_WEBSOCKET_SETTINGS,
+        OPTION_HIDE_STOP_SERVICE,
         OPTION_HIDE_USERNAME_ON_CARD,
         OPTION_HIDE_HELP_CARDS,
         OPTION_DEFAULT_CONNECT_PASSWORD,
@@ -2769,6 +2917,10 @@ pub mod keys {
         OPTION_REGISTER_DEVICE,
         OPTION_HIDE_POWERED_BY_ME,
         OPTION_MAIN_WINDOW_ALWAYS_ON_TOP,
+        OPTION_FILE_TRANSFER_MAX_FILES,
+        OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD,
+        OPTION_DISABLE_CHANGE_ID,
+        OPTION_DISABLE_UNLOCK_PIN,
     ];
 }
 
